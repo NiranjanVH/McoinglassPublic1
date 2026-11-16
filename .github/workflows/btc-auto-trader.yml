@@ -19,6 +19,7 @@ jobs:
       TG_API_HASH: ${{ secrets.TG_API_HASH }}
       TG_TARGET_CHAT: ${{ secrets.TG_TARGET_CHAT }}
       TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+      TG_SESSION_FILE_B64: ${{ secrets.TG_SESSION_FILE_B64 }}
       COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
       COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
       OCI_VM_HOST: ${{ secrets.OCI_VM_HOST }}
@@ -50,8 +51,17 @@ jobs:
       - name: Configure verified SSH host key
         shell: bash
         run: |
-          if [[ -z "$TG_SESSION_STRING" ]]; then
-            echo "Missing required Actions secret: TG_SESSION_STRING" >&2
+          if [[ -n "$TG_SESSION_FILE_B64" ]]; then
+            session_file="$RUNNER_TEMP/telegram_session.session"
+            if ! printf '%s' "$TG_SESSION_FILE_B64" | base64 --decode > "$session_file"; then
+              echo "TG_SESSION_FILE_B64 is not valid base64-encoded Telethon session data." >&2
+              exit 1
+            fi
+            chmod 600 "$session_file"
+            printf 'TG_SESSION_NAME=%s/telegram_session\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+            printf 'TG_SESSION_STRING=\n' >> "$GITHUB_ENV"
+          elif [[ -z "$TG_SESSION_STRING" ]]; then
+            echo "Set TG_SESSION_FILE_B64 (recommended) or TG_SESSION_STRING in Actions secrets." >&2
             exit 1
           fi
           if [[ -z "$OCI_SSH_KNOWN_HOSTS" ]]; then
