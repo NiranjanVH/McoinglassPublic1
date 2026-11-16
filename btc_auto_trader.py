@@ -44,6 +44,10 @@ SSH_KNOWN_HOSTS_FILE = os.path.expanduser(
     os.getenv("SSH_KNOWN_HOSTS_FILE", "~/.ssh/known_hosts")
 )
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no"}
+SSH_STRICT_HOST_KEY_CHECKING = (
+    os.getenv("SSH_STRICT_HOST_KEY_CHECKING", "true").strip().lower()
+    not in {"0", "false", "no"}
+)
 
 # Trading Parameters (BTC Only)
 TARGET_PAIR = "B-BTC_USDT"
@@ -218,8 +222,10 @@ class OracleSshTunnel:
             "-D", f"{SOCKS_HOST}:{SOCKS_PORT}",
             "-p", str(VM_PORT),
             "-o", "IdentitiesOnly=yes",
-            "-o", "StrictHostKeyChecking=yes",
-            "-o", f"UserKnownHostsFile={SSH_KNOWN_HOSTS_FILE}",
+            "-o",
+            f"StrictHostKeyChecking={'yes' if SSH_STRICT_HOST_KEY_CHECKING else 'no'}",
+            "-o",
+            f"UserKnownHostsFile={SSH_KNOWN_HOSTS_FILE if SSH_STRICT_HOST_KEY_CHECKING else '/dev/null'}",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=15",
             "-o", "ConnectTimeout=20",
@@ -556,20 +562,31 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
 # 4. MAIN EXECUTION FLOW
 # ==========================================================
 def validate_config() -> None:
+    if not DRY_RUN and not SSH_STRICT_HOST_KEY_CHECKING:
+        raise RuntimeError(
+            "Live trading requires SSH host-key verification. Set "
+            "SSH_STRICT_HOST_KEY_CHECKING=true and configure the verified OCI host key."
+        )
+
     required = {
         "TG_API_ID": TG_API_ID,
         "TG_API_HASH": TG_API_HASH,
         "TG_TARGET_CHAT": TG_TARGET_CHAT,
-        "COINDCX_API_KEY": COINDCX_API_KEY,
-        "COINDCX_API_SECRET": COINDCX_API_SECRET,
         "OCI_VM_HOST": VM_HOST,
         "OCI_VM_USER": VM_USER,
         "OCI_SSH_PRIVATE_KEY_B64": SSH_KEY_BASE64,
     }
+    if not DRY_RUN:
+        required.update(
+            {
+                "COINDCX_API_KEY": COINDCX_API_KEY,
+                "COINDCX_API_SECRET": COINDCX_API_SECRET,
+            }
+        )
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
-    if not os.path.isfile(SSH_KNOWN_HOSTS_FILE):
+    if SSH_STRICT_HOST_KEY_CHECKING and not os.path.isfile(SSH_KNOWN_HOSTS_FILE):
         raise RuntimeError(
             f"SSH known-hosts file not found: {SSH_KNOWN_HOSTS_FILE}. "
             "Add the VM host key before connecting."
@@ -581,6 +598,8 @@ def run_auto_trader():
     print("=== BTC AUTO-TRADER STARTED ===")
     if DRY_RUN:
         print("[*] DRY_RUN is enabled; orders will not be placed or canceled.")
+    if not SSH_STRICT_HOST_KEY_CHECKING:
+        print("[!] SSH host-key verification is disabled; use only for a non-trading connectivity test.")
 
     # Step 1: Fetch latest signal from Telegram
     signal = asyncio.run(fetch_latest_btc_signal())
@@ -606,11 +625,11 @@ def run_auto_trader():
         exit_ip = verify_exit_ip()
         print(f"[+] Verified Outbound IP via Oracle VM: {exit_ip}")
 
-        action, reason, existing_order = evaluate_btc_exposure(signal)
-
         if DRY_RUN:
-            print(f"[*] Dry run: would {action.lower()} -> {reason}")
+            print("[*] Dry run: SSH tunnel test complete; CoinDCX was not contacted.")
             return
+
+        action, reason, existing_order = evaluate_btc_exposure(signal)
 
         if action == "SKIP":
             print(f"[*] Skipping signal -> {reason}")

@@ -53,7 +53,7 @@ class DryRunTests(unittest.TestCase):
         with patch.object(btc_auto_trader, "DRY_RUN", True):
             btc_auto_trader.run_auto_trader()
 
-        evaluate_exposure.assert_called_once_with(signal)
+        evaluate_exposure.assert_not_called()
         cancel_order.assert_not_called()
         place_order.assert_not_called()
         save_last_processed_id.assert_not_called()
@@ -64,6 +64,16 @@ class TelegramSessionTests(unittest.TestCase):
         with patch.object(btc_auto_trader, "TG_SESSION_STRING", "not-a-session"):
             with self.assertRaisesRegex(ValueError, "TG_SESSION_STRING is invalid"):
                 btc_auto_trader.asyncio.run(btc_auto_trader.fetch_latest_btc_signal())
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_live_trading_rejects_disabled_host_verification(self):
+        with (
+            patch.object(btc_auto_trader, "DRY_RUN", False),
+            patch.object(btc_auto_trader, "SSH_STRICT_HOST_KEY_CHECKING", False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Live trading requires SSH host-key verification"):
+                btc_auto_trader.validate_config()
 
 
 if __name__ == "__main__":
