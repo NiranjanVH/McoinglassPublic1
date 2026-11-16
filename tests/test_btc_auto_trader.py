@@ -59,5 +59,12 @@ class DryRunTests(unittest.TestCase):
         save_last_processed_id.assert_not_called()
 
 
+class TelegramSessionTests(unittest.TestCase):
+    def test_invalid_session_string_has_actionable_error(self):
+        with patch.object(btc_auto_trader, "TG_SESSION_STRING", "not-a-session"):
+            with self.assertRaisesRegex(ValueError, "TG_SESSION_STRING is invalid"):
+                btc_auto_trader.asyncio.run(btc_auto_trader.fetch_latest_btc_signal())
+
+
 if __name__ == "__main__":
     unittest.main()

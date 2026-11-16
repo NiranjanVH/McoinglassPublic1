@@ -125,7 +125,17 @@ def parse_signal_text(text: str) -> Optional[Dict[str, Any]]:
 
 
 async def fetch_latest_btc_signal() -> Optional[Dict[str, Any]]:
-    session = StringSession(TG_SESSION_STRING) if TG_SESSION_STRING else TG_SESSION_NAME
+    if TG_SESSION_STRING:
+        try:
+            session = StringSession(TG_SESSION_STRING.strip())
+        except ValueError as exc:
+            raise ValueError(
+                "TG_SESSION_STRING is invalid. Set it to the exact value returned by "
+                "client.session.save() after completing Telegram login; do not use a "
+                ".session filename, API hash, or surrounding label."
+            ) from exc
+    else:
+        session = TG_SESSION_NAME
     async with TelegramClient(session, TG_API_ID, TG_API_HASH) as client:
         async for message in client.iter_messages(TG_TARGET_CHAT, limit=1):
             parsed = parse_signal_text(message.text)
