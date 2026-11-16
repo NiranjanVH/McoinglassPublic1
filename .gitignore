@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.session
+*.session-journal
+last_processed_signal_id.txt
