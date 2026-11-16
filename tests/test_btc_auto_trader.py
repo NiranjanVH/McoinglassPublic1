@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import btc_auto_trader
@@ -64,6 +65,70 @@ class TelegramSessionTests(unittest.TestCase):
         with patch.object(btc_auto_trader, "TG_SESSION_STRING", "not-a-session"):
             with self.assertRaisesRegex(ValueError, "TG_SESSION_STRING is invalid"):
                 btc_auto_trader.asyncio.run(btc_auto_trader.fetch_latest_btc_signal())
+
+
+class SignalConfirmationTests(unittest.TestCase):
+    def test_returns_latest_signal_when_two_directions_match(self):
+        latest = {"direction": "SHORT", "message_id": 12}
+        previous = {"direction": "SHORT", "message_id": 10}
+
+        self.assertIs(
+            btc_auto_trader.confirm_signal_direction([latest, previous]),
+            latest,
+        )
+
+    def test_rejects_signals_when_directions_disagree(self):
+        latest = {"direction": "LONG", "message_id": 12}
+        previous = {"direction": "SHORT", "message_id": 10}
+
+        self.assertIsNone(
+            btc_auto_trader.confirm_signal_direction([latest, previous])
+        )
+
+    def test_rejects_a_single_signal_without_confirmation(self):
+        self.assertIsNone(
+            btc_auto_trader.confirm_signal_direction(
+                [{"direction": "LONG", "message_id": 12}]
+            )
+        )
+
+    def test_fetch_compares_latest_two_btc_signals_and_uses_newest(self):
+        messages = [
+            SimpleNamespace(
+                id=12,
+                date="today",
+                text="BITCOIN\nDirection: SHORT\nEntry Range: $64,450-$64,600\nLimit: $64,500",
+            ),
+            SimpleNamespace(id=11, date="today", text="ETHEREUM signal"),
+            SimpleNamespace(
+                id=10,
+                date="yesterday",
+                text="BTC\nDirection: SHORT\nEntry Range: $64,400-$64,550\nLimit: $64,450",
+            ),
+        ]
+
+        class FakeTelegramClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def iter_messages(self, chat):
+                for message in messages:
+                    yield message
+
+        with patch.object(
+            btc_auto_trader,
+            "TelegramClient",
+            return_value=FakeTelegramClient(),
+        ):
+            signal = btc_auto_trader.asyncio.run(
+                btc_auto_trader.fetch_latest_btc_signal()
+            )
+
+        self.assertEqual(signal["message_id"], 12)
+        self.assertEqual(signal["direction"], "SHORT")
 
 
 class ConfigurationTests(unittest.TestCase):

@@ -128,6 +128,27 @@ def parse_signal_text(text: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def confirm_signal_direction(signals: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if len(signals) < 2:
+        print("[!] Fewer than two valid BTC signals were found; cannot confirm direction.")
+        return None
+
+    latest, previous = signals[0], signals[1]
+    if latest["direction"] != previous["direction"]:
+        print(
+            f"[!] Latest BTC signal directions disagree "
+            f"({latest['direction']} in Msg {latest['message_id']}, "
+            f"{previous['direction']} in Msg {previous['message_id']}); skipping."
+        )
+        return None
+
+    print(
+        f"[+] Direction confirmed by latest two BTC signals: {latest['direction']} "
+        f"(Msgs {latest['message_id']} and {previous['message_id']})."
+    )
+    return latest
+
+
 async def fetch_latest_btc_signal() -> Optional[Dict[str, Any]]:
     if TG_SESSION_STRING:
         try:
@@ -141,13 +162,16 @@ async def fetch_latest_btc_signal() -> Optional[Dict[str, Any]]:
     else:
         session = TG_SESSION_NAME
     async with TelegramClient(session, TG_API_ID, TG_API_HASH) as client:
-        async for message in client.iter_messages(TG_TARGET_CHAT, limit=1):
+        signals = []
+        async for message in client.iter_messages(TG_TARGET_CHAT):
             parsed = parse_signal_text(message.text)
             if parsed:
                 parsed["message_id"] = message.id
                 parsed["message_date"] = str(message.date)
-            return parsed
-    return None
+                signals.append(parsed)
+                if len(signals) == 2:
+                    break
+    return confirm_signal_direction(signals)
 
 
 def get_last_processed_id() -> Optional[int]:

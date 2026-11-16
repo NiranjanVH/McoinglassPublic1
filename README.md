@@ -5,6 +5,10 @@ trading**. Each run can place or cancel leveraged futures orders based on the
 latest Telegram signal. It requires strict SSH host-key verification and will
 refuse to run live if verification is disabled.
 
+Before proceeding, it compares the directions of the latest two valid BTC
+signals in the Telegram chat. It continues with the newest signal only when
+both are LONG or both are SHORT; otherwise, it skips the run.
+
 Before running it:
 
 1. Add the OCI VM's verified Ed25519 host-key entry as the `OCI_SSH_KNOWN_HOSTS`
