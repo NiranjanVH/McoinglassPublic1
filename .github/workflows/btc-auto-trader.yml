@@ -1,6 +1,8 @@
 name: Run BTC signal trader
 
 on:
+  repository_dispatch:
+    types: [run_coinglass]
   workflow_dispatch:
 
 permissions:
