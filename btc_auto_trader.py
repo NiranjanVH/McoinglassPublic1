@@ -53,7 +53,7 @@ SSH_STRICT_HOST_KEY_CHECKING = (
 TARGET_PAIR = "B-BTC_USDT"
 LEVERAGE = 27
 TP_POINTS = 300.0
-MIN_BTC_QUANTITY = Decimal("0.001")
+MIN_BTC_QUANTITY = Decimal("0.009")
 
 BASE_URL = "https://api.coindcx.com"
 USER_AGENT = "RichieRich-AutoBTC/1.0"
