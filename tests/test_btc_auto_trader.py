@@ -132,6 +132,23 @@ class SignalConfirmationTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_btc_quantity_uses_fixed_minimum_lot(self):
+        quantity = btc_auto_trader.calculate_min_btc_quantity(
+            inr_balance=263.27,
+            conversion_rate=90,
+            limit_price=64620,
+        )
+
+        self.assertEqual(quantity, 0.001)
+
+    def test_btc_quantity_still_checks_required_margin(self):
+        with self.assertRaisesRegex(ValueError, "Insufficient INR balance"):
+            btc_auto_trader.calculate_min_btc_quantity(
+                inr_balance=200,
+                conversion_rate=90,
+                limit_price=64620,
+            )
+
     def test_live_trading_rejects_disabled_host_verification(self):
         with (
             patch.object(btc_auto_trader, "DRY_RUN", False),

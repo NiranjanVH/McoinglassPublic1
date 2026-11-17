@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -53,7 +53,7 @@ SSH_STRICT_HOST_KEY_CHECKING = (
 TARGET_PAIR = "B-BTC_USDT"
 LEVERAGE = 27
 TP_POINTS = 300.0
-MIN_TARGET_INR_MARGIN = 300.0  # Targets ~₹300 margin (floored to exchange min 0.001 BTC if smaller)
+MIN_BTC_QUANTITY = Decimal("0.001")
 
 BASE_URL = "https://api.coindcx.com"
 USER_AGENT = "RichieRich-AutoBTC/1.0"
@@ -490,23 +490,9 @@ def calculate_min_btc_quantity(
     conversion_rate: float,
     limit_price: float,
     leverage: int = LEVERAGE,
-    target_inr_margin: float = MIN_TARGET_INR_MARGIN,
 ) -> float:
-    """
-    Calculates the minimum valid BTC order quantity (step 0.001 BTC) targeting ~₹300 margin
-    (or the exchange's minimum 0.001 BTC lot, whichever is larger).
-    """
-    step = Decimal("0.001")
-
-    # Convert target ₹300 margin into USDT notional at 27x leverage
-    target_margin_usdt = target_inr_margin / conversion_rate
-    target_notional_usdt = target_margin_usdt * leverage
-    raw_qty = Decimal(str(target_notional_usdt / limit_price))
-
-    # Round UP to the nearest 0.001 BTC lot so it satisfies minimum notional requirements
-    qty = (raw_qty / step).to_integral_value(rounding=ROUND_UP) * step
-    if qty < step:
-        qty = step
+    """Uses the fixed 0.001 BTC minimum lot and verifies its required margin."""
+    qty = MIN_BTC_QUANTITY
 
     # Verify required INR margin is available in wallet
     required_usdt_margin = (float(qty) * limit_price) / leverage
@@ -539,7 +525,6 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
         conversion_rate=conversion_rate,
         limit_price=limit_price,
         leverage=LEVERAGE,
-        target_inr_margin=MIN_TARGET_INR_MARGIN,
     )
 
     # Note: stop_loss_price intentionally omitted per instructions
