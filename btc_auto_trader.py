@@ -1,15 +1,10 @@
 import asyncio
-import base64
-import binascii
 import hashlib
 import hmac
 import json
 import os
 import re
-import socket
-import subprocess
 import sys
-import tempfile
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -22,7 +17,7 @@ from telethon.sessions import StringSession
 load_dotenv()
 
 # ==========================================================
-# CONFIGURATION (load credentials from an untracked .env file)
+# CONFIGURATION
 # ==========================================================
 TG_API_ID = int(os.getenv("TG_API_ID") or "0")
 TG_API_HASH = os.getenv("TG_API_HASH", "")
@@ -34,20 +29,9 @@ STATE_FILE = os.getenv("STATE_FILE", "last_processed_signal_id.txt")
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
 COINDCX_API_SECRET = os.getenv("COINDCX_API_SECRET", "")
 
-VM_HOST = os.getenv("OCI_VM_HOST", "")
-VM_PORT = int(os.getenv("OCI_VM_PORT") or "22")
-VM_USER = os.getenv("OCI_VM_USER", "")
-SOCKS_HOST = os.getenv("SOCKS_HOST", "127.0.0.1")
-SOCKS_PORT = int(os.getenv("SOCKS_PORT") or "1080")
-SSH_KEY_BASE64 = os.getenv("OCI_SSH_PRIVATE_KEY_B64", "")
-SSH_KNOWN_HOSTS_FILE = os.path.expanduser(
-    os.getenv("SSH_KNOWN_HOSTS_FILE", "~/.ssh/known_hosts")
-)
+# GCP Static IP Proxy URL
+PROXY_URL = os.getenv("GCP_PROXY_URL", "http://35.208.231.235:8000")
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no"}
-SSH_STRICT_HOST_KEY_CHECKING = (
-    os.getenv("SSH_STRICT_HOST_KEY_CHECKING", "true").strip().lower()
-    not in {"0", "false", "no"}
-)
 
 # Trading Parameters (BTC Only)
 TARGET_PAIR = "B-BTC_USDT"
@@ -55,12 +39,7 @@ LEVERAGE = 27
 TP_POINTS = 300.0
 MIN_BTC_QUANTITY = Decimal("0.009")
 
-BASE_URL = "https://api.coindcx.com"
 USER_AGENT = "RichieRich-AutoBTC/1.0"
-PROXIES = {
-    "http": f"socks5h://{SOCKS_HOST}:{SOCKS_PORT}",
-    "https": f"socks5h://{SOCKS_HOST}:{SOCKS_PORT}",
-}
 
 
 # ==========================================================
@@ -74,15 +53,12 @@ def parse_signal_text(text: str) -> Optional[Dict[str, Any]]:
     main_section = cleaned_text.split("Alternative Trades")[0]
     clean_block = main_section.replace("**", "").replace("*", "")
 
-    # Ensure it is a Bitcoin signal
     if "BITCOIN" not in clean_block.upper() and "BTC" not in clean_block.upper():
         return None
 
-    # 1. Direction (SHORT or LONG)
     dir_match = re.search(r"Direction\s*:\s*(SHORT|LONG)", clean_block, re.IGNORECASE)
     direction = dir_match.group(1).upper() if dir_match else None
 
-    # 2. Extract Entry Range bounds (e.g. $64,600–$64,750)
     range_match = re.search(
         r"Entry Range\s*:\s*\$?([\d,]+(?:\.\d+)?)\s*[-–—]\s*\$?([\d,]+(?:\.\d+)?)",
         clean_block,
@@ -91,7 +67,6 @@ def parse_signal_text(text: str) -> Optional[Dict[str, Any]]:
     range_low = float(range_match.group(1).replace(",", "")) if range_match else None
     range_high = float(range_match.group(2).replace(",", "")) if range_match else None
 
-    # 3. Limit Entry Price (falls back to upper range bound if "Limit:" is absent)
     limit_match = re.search(r"Entry Range.*?Limit\s*:\s*\$?([\d,]+(?:\.\d+)?)", clean_block, re.IGNORECASE)
     if limit_match:
         entry_val = float(limit_match.group(1).replace(",", ""))
@@ -103,7 +78,6 @@ def parse_signal_text(text: str) -> Optional[Dict[str, Any]]:
     if not direction or entry_val is None:
         return None
 
-    # Ensure range bounds are properly ordered (low <= high), fallback to entry_val if absent
     if range_low is not None and range_high is not None:
         r_min, r_max = min(range_low, range_high), max(range_low, range_high)
     else:
@@ -111,7 +85,6 @@ def parse_signal_text(text: str) -> Optional[Dict[str, Any]]:
 
     tp1_val = (entry_val - TP_POINTS) if direction == "SHORT" else (entry_val + TP_POINTS)
 
-    # Optional metadata for logging
     sl_match = re.search(r"Stop Loss\s*:\s*\$?([\d,]+(?:\.\d+)?)", clean_block, re.IGNORECASE)
     prob_match = re.search(r"Probability\s*:\s*([\d]+%)", clean_block, re.IGNORECASE)
     conf_match = re.search(r"Confidence\s*:\s*([\d]+%)", clean_block, re.IGNORECASE)
@@ -190,115 +163,7 @@ def save_last_processed_id(msg_id: int) -> None:
 
 
 # ==========================================================
-# 2. SSH SOCKS5 TUNNEL MANAGEMENT
-# ==========================================================
-def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def write_ssh_key_tempfile() -> str:
-    if not SSH_KEY_BASE64:
-        raise RuntimeError("OCI_SSH_PRIVATE_KEY_B64 is required to start the SSH tunnel.")
-    try:
-        pem_bytes = base64.b64decode(SSH_KEY_BASE64, validate=True)
-    except binascii.Error as exc:
-        raise ValueError("OCI_SSH_PRIVATE_KEY_B64 must contain valid base64.") from exc
-    fd, path = tempfile.mkstemp(prefix="oci_key_", suffix=".key")
-    with os.fdopen(fd, "wb") as f:
-        f.write(pem_bytes.replace(b"\r\n", b"\n"))
-
-    if os.name == "nt":
-        username = os.environ.get("USERNAME", "")
-        if username:
-            subprocess.run(
-                ["icacls", path, "/inheritance:r", "/grant:r", f"{username}:R"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-    else:
-        os.chmod(path, 0o600)
-    return path
-
-
-class OracleSshTunnel:
-    def __init__(self):
-        self.proc: Optional[subprocess.Popen] = None
-        self.key_path: Optional[str] = None
-        self.owns_tunnel = False
-
-    def __enter__(self):
-        if is_port_open(SOCKS_HOST, SOCKS_PORT):
-            print(f"[*] SOCKS5 proxy already listening on {SOCKS_HOST}:{SOCKS_PORT}, reusing it.")
-            return self
-
-        print(f"[*] Starting SSH SOCKS5 tunnel -> {VM_USER}@{VM_HOST}:{VM_PORT}...")
-        self.key_path = write_ssh_key_tempfile()
-
-        cmd = [
-            "ssh",
-            "-i", self.key_path,
-            "-N",
-            "-D", f"{SOCKS_HOST}:{SOCKS_PORT}",
-            "-p", str(VM_PORT),
-            "-o", "IdentitiesOnly=yes",
-            "-o",
-            f"StrictHostKeyChecking={'yes' if SSH_STRICT_HOST_KEY_CHECKING else 'no'}",
-            "-o",
-            f"UserKnownHostsFile={SSH_KNOWN_HOSTS_FILE if SSH_STRICT_HOST_KEY_CHECKING else '/dev/null'}",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ConnectTimeout=20",
-            f"{VM_USER}@{VM_HOST}",
-        ]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.owns_tunnel = True
-
-        deadline = time.time() + 25
-        try:
-            while time.time() < deadline:
-                if self.proc.poll() is not None:
-                    _, stderr = self.proc.communicate()
-                    raise RuntimeError(f"SSH exited early ({self.proc.returncode}): {stderr.strip()}")
-                if is_port_open(SOCKS_HOST, SOCKS_PORT):
-                    print(f"[+] SSH tunnel active on {SOCKS_HOST}:{SOCKS_PORT}")
-                    return self
-                time.sleep(0.3)
-            raise TimeoutError(f"Timed out waiting for SOCKS5 port {SOCKS_HOST}:{SOCKS_PORT}")
-        except Exception:
-            if self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-            if self.key_path and os.path.exists(self.key_path):
-                os.remove(self.key_path)
-                self.key_path = None
-            raise
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.owns_tunnel and self.proc is not None and self.proc.poll() is None:
-            print("[*] Closing SSH tunnel...")
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-
-        if self.key_path and os.path.exists(self.key_path):
-            try:
-                os.remove(self.key_path)
-            except OSError:
-                pass
-
-
-# ==========================================================
-# 3. COINDCX API HELPERS, POSITION & ORDER EVALUATION
+# 2. COINDCX API HELPERS VIA GCP STATIC IP PROXY
 # ==========================================================
 def sign_payload(secret: str, payload: str) -> str:
     return hmac.new(
@@ -316,16 +181,10 @@ def signed_request(method: str, path: str, payload_dict: Dict[str, Any]) -> requ
         "X-AUTH-APIKEY": COINDCX_API_KEY.strip(),
         "X-AUTH-SIGNATURE": sign_payload(COINDCX_API_SECRET, body),
     }
-    url = f"{BASE_URL}{path}"
+    url = f"{PROXY_URL}{path}"
     if method.upper() == "GET":
-        return requests.get(url, data=body, headers=headers, proxies=PROXIES, timeout=15)
-    return requests.post(url, data=body, headers=headers, proxies=PROXIES, timeout=15)
-
-
-def verify_exit_ip() -> str:
-    resp = requests.get("https://api.ipify.org?format=json", proxies=PROXIES, timeout=12)
-    resp.raise_for_status()
-    return resp.json().get("ip", "")
+        return requests.get(url, data=body, headers=headers, timeout=15)
+    return requests.post(url, data=body, headers=headers, timeout=15)
 
 
 def get_futures_inr_balance() -> float:
@@ -370,18 +229,6 @@ def cancel_order_by_id(order_id: str) -> None:
 
 
 def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Optional[Dict[str, Any]]]:
-    """
-    Evaluates current BTCUSDT INR positions and open orders against the incoming signal.
-    Returns (action, reason, existing_order_dict):
-      - ("SKIP", reason, None)    -> Active position exists, existing order is inside Entry Range,
-                                     or price condition did not meet modify threshold.
-      - ("MODIFY", reason, order) -> Unfilled open order exists in the SAME direction, its current
-                                     limit price is OUTSIDE [range_low, range_high], AND:
-                                     * SHORT: new limit price < existing limit price
-                                     * LONG:  new limit price > existing limit price
-      - ("PLACE", reason, None)   -> No active position and no open order.
-    """
-    # 1. Check active positions
     pos_payload = {
         "timestamp": int(round(time.time() * 1000)),
         "page": "1",
@@ -401,7 +248,6 @@ def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Option
             if active_pos != 0:
                 return "SKIP", f"Active BTC position found (size: {active_pos})", None
 
-    # 2. Check open / untriggered limit orders
     open_btc_orders: List[Dict[str, Any]] = []
     for side in ("buy", "sell"):
         ord_payload = {
@@ -425,9 +271,8 @@ def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Option
     if not open_btc_orders:
         return "PLACE", "No active BTC position or open order found", None
 
-    # Evaluate the existing open order against the new signal
     existing_order = open_btc_orders[0]
-    existing_side = str(existing_order.get("side", "")).lower()  # "buy" or "sell"
+    existing_side = str(existing_order.get("side", "")).lower()
     existing_price = float(existing_order.get("price", 0) or 0)
     existing_status = str(existing_order.get("status", "")).lower()
 
@@ -437,11 +282,9 @@ def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Option
     range_low = float(signal_data["range_low"])
     range_high = float(signal_data["range_high"])
 
-    # Do not modify partially filled orders
     if existing_status == "partially_filled":
         return "SKIP", f"Existing order {existing_order.get('id')} is already partially filled", None
 
-    # Must match the same direction (LONG->buy, SHORT->sell)
     if existing_side != expected_side:
         return (
             "SKIP",
@@ -450,7 +293,6 @@ def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Option
             None,
         )
 
-    # Rule 1: If existing open order limit price is already inside Entry Range, do NOT update
     if range_low <= existing_price <= range_high:
         return (
             "SKIP",
@@ -459,9 +301,6 @@ def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Option
             None,
         )
 
-    # Rule 2 (only when existing order price is NOT in range):
-    # - SHORT: modify if new limit price is reduced (new_price < existing_price)
-    # - LONG:  modify if new limit price is increased (new_price > existing_price)
     if new_direction == "SHORT" and new_price < existing_price:
         return (
             "MODIFY",
@@ -491,10 +330,7 @@ def calculate_min_btc_quantity(
     limit_price: float,
     leverage: int = LEVERAGE,
 ) -> float:
-    """Uses the fixed 0.001 BTC minimum lot and verifies its required margin."""
     qty = MIN_BTC_QUANTITY
-
-    # Verify required INR margin is available in wallet
     required_usdt_margin = (float(qty) * limit_price) / leverage
     required_inr_margin = required_usdt_margin * conversion_rate
 
@@ -527,7 +363,6 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
         leverage=LEVERAGE,
     )
 
-    # Note: stop_loss_price intentionally omitted per instructions
     payload = {
         "timestamp": int(round(time.time() * 1000)),
         "order": {
@@ -568,22 +403,14 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ==========================================================
-# 4. MAIN EXECUTION FLOW
+# 3. MAIN EXECUTION FLOW
 # ==========================================================
 def validate_config() -> None:
-    if not DRY_RUN and not SSH_STRICT_HOST_KEY_CHECKING:
-        raise RuntimeError(
-            "Live trading requires SSH host-key verification. Set "
-            "SSH_STRICT_HOST_KEY_CHECKING=true and configure the verified OCI host key."
-        )
-
     required = {
         "TG_API_ID": TG_API_ID,
         "TG_API_HASH": TG_API_HASH,
         "TG_TARGET_CHAT": TG_TARGET_CHAT,
-        "OCI_VM_HOST": VM_HOST,
-        "OCI_VM_USER": VM_USER,
-        "OCI_SSH_PRIVATE_KEY_B64": SSH_KEY_BASE64,
+        "GCP_PROXY_URL": PROXY_URL,
     }
     if not DRY_RUN:
         required.update(
@@ -595,11 +422,6 @@ def validate_config() -> None:
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
-    if SSH_STRICT_HOST_KEY_CHECKING and not os.path.isfile(SSH_KNOWN_HOSTS_FILE):
-        raise RuntimeError(
-            f"SSH known-hosts file not found: {SSH_KNOWN_HOSTS_FILE}. "
-            "Add the VM host key before connecting."
-        )
 
 
 def run_auto_trader():
@@ -607,10 +429,7 @@ def run_auto_trader():
     print("=== BTC AUTO-TRADER STARTED ===")
     if DRY_RUN:
         print("[*] DRY_RUN is enabled; orders will not be placed or canceled.")
-    if not SSH_STRICT_HOST_KEY_CHECKING:
-        print("[!] SSH host-key verification is disabled; use only for a non-trading connectivity test.")
 
-    # Step 1: Fetch latest signal from Telegram
     signal = asyncio.run(fetch_latest_btc_signal())
     if not signal:
         print("[!] No valid Bitcoin trade signal found in the latest message. Exiting.")
@@ -623,38 +442,31 @@ def run_auto_trader():
         f"Prob: {signal['probability']} | Conf: {signal['confidence']}"
     )
 
-    # Step 2: Skip if this exact Telegram message was already processed
     last_id = get_last_processed_id()
     if last_id == signal["message_id"]:
         print(f"[*] Signal Msg ID {last_id} was already processed earlier. Ignoring.")
         return
 
-    # Step 3: Open SSH Tunnel and evaluate CoinDCX state
-    with OracleSshTunnel():
-        exit_ip = verify_exit_ip()
-        print(f"[+] Verified Outbound IP via Oracle VM: {exit_ip}")
+    if DRY_RUN:
+        print("[*] Dry run: Signal parsed successfully; CoinDCX was not contacted.")
+        return
 
-        if DRY_RUN:
-            print("[*] Dry run: SSH tunnel test complete; CoinDCX was not contacted.")
-            return
+    action, reason, existing_order = evaluate_btc_exposure(signal)
 
-        action, reason, existing_order = evaluate_btc_exposure(signal)
-
-        if action == "SKIP":
-            print(f"[*] Skipping signal -> {reason}")
-            save_last_processed_id(signal["message_id"])
-            return
-
-        if action == "MODIFY" and existing_order:
-            print(f"[*] Modifying order -> {reason}")
-            cancel_order_by_id(existing_order["id"])
-            time.sleep(0.5)  # Brief pause so margin unlocks cleanly before re-placing
-
-        # Step 4: Place Limit Order with TP (no SL)
-        order_result = place_btc_limit_order(signal)
+    if action == "SKIP":
+        print(f"[*] Skipping signal -> {reason}")
         save_last_processed_id(signal["message_id"])
-        print(f"[+] ORDER {'MODIFIED' if action == 'MODIFY' else 'PLACED'} SUCCESSFULLY:")
-        print(json.dumps(order_result, indent=2))
+        return
+
+    if action == "MODIFY" and existing_order:
+        print(f"[*] Modifying order -> {reason}")
+        cancel_order_by_id(existing_order["id"])
+        time.sleep(0.5)
+
+    order_result = place_btc_limit_order(signal)
+    save_last_processed_id(signal["message_id"])
+    print(f"[+] ORDER {'MODIFIED' if action == 'MODIFY' else 'PLACED'} SUCCESSFULLY:")
+    print(json.dumps(order_result, indent=2))
 
 
 if __name__ == "__main__":
