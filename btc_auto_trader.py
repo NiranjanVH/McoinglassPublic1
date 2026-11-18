@@ -38,8 +38,8 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no
 TARGET_PAIR = "B-BTC_USDT"
 LEVERAGE = 27
 TP_POINTS = 300.0
-BALANCE_ALLOCATION_PCT = 80.0  # Use 80% of wallet balance
-MIN_BTC_QUANTITY = Decimal("0.009")
+BALANCE_ALLOCATION_PCT = 80.0  # Uses 80% of your INR balance for margin
+MIN_ALLOWED_BTC_QUANTITY = Decimal("0.001")  # Absolute lowest exchange step size if needed
 
 USER_AGENT = "RichieRich-AutoBTC/1.0"
 
@@ -263,10 +263,6 @@ def list_positions() -> List[Dict[str, Any]]:
 
 
 def close_position_conditional_auto() -> List[Dict[str, Any]]:
-    """
-    Checks active positions and associated TP orders.
-    Places opposing closing order using the TP order's price, then cancels old TP orders.
-    """
     print("[*] Checking active positions and open orders...")
     positions = list_positions()
     if not positions:
@@ -438,29 +434,28 @@ def calculate_dynamic_btc_quantity(
     leverage: int = LEVERAGE,
     allocation_pct: float = BALANCE_ALLOCATION_PCT,
 ) -> float:
-    """Calculates quantity using 80% of wallet balance, rounded down to prevent over-allocation."""
+    """Calculates quantity dynamically using 80% of wallet balance, rounded down to 0.001 step size."""
     allocated_inr = inr_balance * (allocation_pct / 100.0)
     margin_usdt = allocated_inr / conversion_rate
     position_value_usdt = margin_usdt * leverage
     raw_qty = position_value_usdt / limit_price
 
-    # BTC step size precision
+    # Round down to 0.001 precision step
     step = Decimal("0.001")
     floored_units = Decimal(str(math.floor(raw_qty / float(step))))
     quantity = (floored_units * step).quantize(step, rounding=ROUND_DOWN)
 
-    # Ensure required margin does not exceed available INR balance
     required_usdt_margin = (float(quantity) * limit_price) / leverage
     required_inr_margin = required_usdt_margin * conversion_rate
 
     print(
-        f"[*] Sizing (80% allocation): Qty={quantity} BTC | Est. Margin Required=₹{required_inr_margin:.2f} "
-        f"(Available Balance: ₹{inr_balance:.2f})"
+        f"[*] Sizing ({allocation_pct}% balance allocation): Qty={quantity} BTC | "
+        f"Est. Margin Required=₹{required_inr_margin:.2f} (Available Balance: ₹{inr_balance:.2f})"
     )
 
-    if quantity < MIN_BTC_QUANTITY:
+    if quantity < MIN_ALLOWED_BTC_QUANTITY:
         raise ValueError(
-            f"Calculated quantity ({quantity} BTC) is below minimum allowed lot size ({MIN_BTC_QUANTITY} BTC)."
+            f"Calculated quantity ({quantity} BTC) is below exchange minimum step size ({MIN_ALLOWED_BTC_QUANTITY} BTC)."
         )
 
     if inr_balance < required_inr_margin:
@@ -486,7 +481,6 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
         conversion_rate=conversion_rate,
         limit_price=limit_price,
         leverage=LEVERAGE,
-        allocation_pct=BALANCE_ALLOCATION_PCT,
     )
 
     payload = {
