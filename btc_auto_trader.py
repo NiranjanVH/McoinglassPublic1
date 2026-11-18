@@ -1,13 +1,13 @@
-
 import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sys
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -30,14 +30,15 @@ STATE_FILE = os.getenv("STATE_FILE", "last_processed_signal_id.txt")
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
 COINDCX_API_SECRET = os.getenv("COINDCX_API_SECRET", "")
 
-# GCP Static IP Proxy URL
-PROXY_URL = os.getenv("GCP_PROXY_URL", "")
+# GCP Static IP Proxy URL (Strictly from Environment / Secret)
+PROXY_URL = os.getenv("GCP_PROXY_URL", "").strip()
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no"}
 
 # Trading Parameters (BTC Only)
 TARGET_PAIR = "B-BTC_USDT"
 LEVERAGE = 27
 TP_POINTS = 300.0
+BALANCE_ALLOCATION_PCT = 80.0  # Use 80% of wallet balance
 MIN_BTC_QUANTITY = Decimal("0.009")
 
 USER_AGENT = "RichieRich-AutoBTC/1.0"
@@ -290,7 +291,6 @@ def close_position_conditional_auto() -> List[Dict[str, Any]]:
         pair_open_orders = [o for o in open_orders if o.get("pair") == TARGET_PAIR and o.get("id")]
         closing_side = "sell" if side == "buy" else "buy"
 
-        # Extract price from the existing TP order
         closing_price = 0.0
         for ord_item in pair_open_orders:
             p_val = float(ord_item.get("price", 0.0) or 0.0)
@@ -298,7 +298,6 @@ def close_position_conditional_auto() -> List[Dict[str, Any]]:
                 closing_price = p_val
                 break
 
-        # Fallback to ticker price or entry price if no TP order price found
         if closing_price <= 0:
             try:
                 t_resp = requests.get(f"{PROXY_URL}/exchange/v1/derivatives/futures/data/active_instruments", timeout=10)
@@ -432,28 +431,45 @@ def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Option
     )
 
 
-def calculate_min_btc_quantity(
+def calculate_dynamic_btc_quantity(
     inr_balance: float,
     conversion_rate: float,
     limit_price: float,
     leverage: int = LEVERAGE,
+    allocation_pct: float = BALANCE_ALLOCATION_PCT,
 ) -> float:
-    qty = MIN_BTC_QUANTITY
-    required_usdt_margin = (float(qty) * limit_price) / leverage
+    """Calculates quantity using 80% of wallet balance, rounded down to prevent over-allocation."""
+    allocated_inr = inr_balance * (allocation_pct / 100.0)
+    margin_usdt = allocated_inr / conversion_rate
+    position_value_usdt = margin_usdt * leverage
+    raw_qty = position_value_usdt / limit_price
+
+    # BTC step size precision
+    step = Decimal("0.001")
+    floored_units = Decimal(str(math.floor(raw_qty / float(step))))
+    quantity = (floored_units * step).quantize(step, rounding=ROUND_DOWN)
+
+    # Ensure required margin does not exceed available INR balance
+    required_usdt_margin = (float(quantity) * limit_price) / leverage
     required_inr_margin = required_usdt_margin * conversion_rate
 
     print(
-        f"[*] Sizing: Qty={qty} BTC | Est. Margin Required=₹{required_inr_margin:.2f} "
-        f"(Available: ₹{inr_balance:.2f})"
+        f"[*] Sizing (80% allocation): Qty={quantity} BTC | Est. Margin Required=₹{required_inr_margin:.2f} "
+        f"(Available Balance: ₹{inr_balance:.2f})"
     )
+
+    if quantity < MIN_BTC_QUANTITY:
+        raise ValueError(
+            f"Calculated quantity ({quantity} BTC) is below minimum allowed lot size ({MIN_BTC_QUANTITY} BTC)."
+        )
 
     if inr_balance < required_inr_margin:
         raise ValueError(
-            f"Insufficient INR balance (₹{inr_balance:.2f}) for minimum BTC order "
+            f"Insufficient INR balance (₹{inr_balance:.2f}) for calculated order size "
             f"(requires ~₹{required_inr_margin:.2f} at {leverage}x)."
         )
 
-    return float(qty)
+    return float(quantity)
 
 
 def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -464,11 +480,13 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
 
     inr_balance = get_futures_inr_balance()
     conversion_rate = get_inr_usdt_conversion()
-    quantity = calculate_min_btc_quantity(
+    
+    quantity = calculate_dynamic_btc_quantity(
         inr_balance=inr_balance,
         conversion_rate=conversion_rate,
         limit_price=limit_price,
         leverage=LEVERAGE,
+        allocation_pct=BALANCE_ALLOCATION_PCT,
     )
 
     payload = {
@@ -538,7 +556,6 @@ def run_auto_trader():
     if DRY_RUN:
         print("[*] DRY_RUN is enabled; orders will not be placed or canceled.")
 
-    # Check and handle existing open positions by placing the closing limit order at the TP price
     if not DRY_RUN:
         try:
             closed_results = close_position_conditional_auto()
