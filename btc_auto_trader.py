@@ -2,11 +2,12 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sys
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -37,7 +38,8 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no
 TARGET_PAIR = "B-BTC_USDT"
 LEVERAGE = 27
 TP_POINTS = 300.0
-MIN_BTC_QUANTITY = Decimal("0.009")
+BALANCE_ALLOCATION_PCT = 80.0             # Uses 80% of your INR wallet balance for margin
+MIN_ALLOWED_BTC_QUANTITY = Decimal("0.001") # Lowest step size precision limit
 
 USER_AGENT = "RichieRich-AutoBTC/1.0"
 
@@ -217,6 +219,24 @@ def get_inr_usdt_conversion() -> float:
     raise ValueError("INR/USDT conversion rate not found.")
 
 
+def list_open_orders(side: Optional[str] = None, status: str = "open,partially_filled,untriggered") -> List[Dict[str, Any]]:
+    sides = [side] if side else ["buy", "sell"]
+    all_orders: List[Dict[str, Any]] = []
+    for s in sides:
+        payload = {
+            "timestamp": int(round(time.time() * 1000)),
+            "status": status,
+            "side": s,
+            "page": "1",
+            "size": "50",
+            "margin_currency_short_name": ["INR"],
+        }
+        resp = signed_request("POST", "/exchange/v1/derivatives/futures/orders", payload)
+        if 200 <= resp.status_code < 300 and isinstance(resp.json(), list):
+            all_orders.extend(resp.json())
+    return all_orders
+
+
 def cancel_order_by_id(order_id: str) -> None:
     payload = {
         "timestamp": int(round(time.time() * 1000)),
@@ -228,50 +248,118 @@ def cancel_order_by_id(order_id: str) -> None:
         raise RuntimeError(f"Cancel failed ({resp.status_code}): {resp.text}")
 
 
-def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Optional[Dict[str, Any]]]:
-    pos_payload = {
+def list_positions() -> List[Dict[str, Any]]:
+    payload = {
         "timestamp": int(round(time.time() * 1000)),
         "page": "1",
         "size": "50",
         "margin_currency_short_name": ["INR"],
     }
-    pos_resp = signed_request("POST", "/exchange/v1/derivatives/futures/positions", pos_payload)
-    if not (200 <= pos_resp.status_code < 300):
-        raise RuntimeError(f"Positions check failed (HTTP {pos_resp.status_code}): {pos_resp.text}")
+    resp = signed_request("POST", "/exchange/v1/derivatives/futures/positions", payload)
+    if not (200 <= resp.status_code < 300):
+        raise RuntimeError(f"Positions check failed (HTTP {resp.status_code}): {resp.text}")
+    data = resp.json()
+    return data if isinstance(data, list) else []
 
-    positions = pos_resp.json()
-    if not isinstance(positions, list):
-        raise ValueError("Unexpected response while checking futures positions.")
+
+def close_position_conditional_auto() -> List[Dict[str, Any]]:
+    print("[*] Checking active positions and open orders...")
+    positions = list_positions()
+    if not positions:
+        return []
+
+    open_orders = list_open_orders()
+    results = []
+
+    for target_pos in positions:
+        if target_pos.get("pair") != TARGET_PAIR:
+            continue
+        
+        active_pos = float(target_pos.get("active_pos", 0) or 0)
+        if active_pos == 0:
+            continue
+
+        side = str(target_pos.get("side", "")).lower()
+        quantity = float(target_pos.get("quantity") or target_pos.get("total_quantity") or 0.0)
+        if quantity <= 0:
+            continue
+
+        pair_open_orders = [o for o in open_orders if o.get("pair") == TARGET_PAIR and o.get("id")]
+        closing_side = "sell" if side == "buy" else "buy"
+
+        # Extract price strictly from the existing TP order
+        closing_price = 0.0
+        for ord_item in pair_open_orders:
+            p_val = float(ord_item.get("price", 0.0) or 0.0)
+            if p_val > 0:
+                closing_price = p_val
+                break
+
+        if closing_price <= 0:
+            try:
+                t_resp = requests.get(f"{PROXY_URL}/exchange/v1/derivatives/futures/data/active_instruments", timeout=10)
+                if 200 <= t_resp.status_code < 300:
+                    for inst in t_resp.json():
+                        if inst.get("pair") == TARGET_PAIR:
+                            closing_price = float(inst.get("last_price") or inst.get("price") or 0.0)
+                            break
+            except Exception:
+                pass
+
+        if closing_price <= 0:
+            closing_price = float(target_pos.get("average_price") or target_pos.get("entry_price") or 64150.0)
+
+        payload = {
+            "timestamp": int(round(time.time() * 1000)),
+            "order": {
+                "fromOrderForm": False,
+                "pair": TARGET_PAIR,
+                "order_type": "limit_order",
+                "price": closing_price,
+                "side": closing_side,
+                "total_quantity": quantity,
+                "leverage": 1,
+                "margin_currency_short_name": "INR",
+                "notification": "email_notification",
+                "time_in_force": "good_till_cancel"
+            }
+        }
+
+        print(f"[*] Submitting opposing Close Position Limit Order at TP price ({closing_price:,.2f}) for {TARGET_PAIR}...")
+        resp = signed_request("POST", "/exchange/v1/derivatives/futures/orders/create", payload)
+        print(f"[*] Close Order HTTP {resp.status_code}: {resp.text}")
+
+        if not (200 <= resp.status_code < 300):
+            raise RuntimeError(f"Close position order failed ({resp.status_code}): {resp.text}")
+
+        results.append(resp.json())
+
+        print(f"[*] Cancelling associated TP / open orders for {TARGET_PAIR}...")
+        for ord_item in pair_open_orders:
+            oid = ord_item.get("id")
+            try:
+                cancel_order_by_id(oid)
+            except Exception as e:
+                print(f"[!] Warning: Could not cancel order {oid}: {e}")
+
+    return results
+
+
+def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Optional[Dict[str, Any]]]:
+    positions = list_positions()
     for p in positions:
         if p.get("pair") == TARGET_PAIR:
             active_pos = float(p.get("active_pos", 0) or 0)
             if active_pos != 0:
                 return "SKIP", f"Active BTC position found (size: {active_pos})", None
 
-    open_btc_orders: List[Dict[str, Any]] = []
-    for side in ("buy", "sell"):
-        ord_payload = {
-            "timestamp": int(round(time.time() * 1000)),
-            "status": "open,partially_filled,untriggered",
-            "side": side,
-            "page": "1",
-            "size": "50",
-            "margin_currency_short_name": ["INR"],
-        }
-        ord_resp = signed_request("POST", "/exchange/v1/derivatives/futures/orders", ord_payload)
-        if not (200 <= ord_resp.status_code < 300):
-            raise RuntimeError(f"Open orders check failed (HTTP {ord_resp.status_code}): {ord_resp.text}")
-        orders = ord_resp.json()
-        if not isinstance(orders, list):
-            raise ValueError("Unexpected response while checking open futures orders.")
-        for order in orders:
-            if order.get("pair") == TARGET_PAIR:
-                open_btc_orders.append(order)
+    open_btc_orders = list_open_orders()
+    pair_open_orders = [o for o in open_btc_orders if o.get("pair") == TARGET_PAIR]
 
-    if not open_btc_orders:
+    if not pair_open_orders:
         return "PLACE", "No active BTC position or open order found", None
 
-    existing_order = open_btc_orders[0]
+    existing_order = pair_open_orders[0]
     existing_side = str(existing_order.get("side", "")).lower()
     existing_price = float(existing_order.get("price", 0) or 0)
     existing_status = str(existing_order.get("status", "")).lower()
@@ -324,28 +412,43 @@ def evaluate_btc_exposure(signal_data: Dict[str, Any]) -> tuple[str, str, Option
     )
 
 
-def calculate_min_btc_quantity(
+def calculate_dynamic_btc_quantity(
     inr_balance: float,
     conversion_rate: float,
     limit_price: float,
     leverage: int = LEVERAGE,
+    allocation_pct: float = BALANCE_ALLOCATION_PCT,
 ) -> float:
-    qty = MIN_BTC_QUANTITY
-    required_usdt_margin = (float(qty) * limit_price) / leverage
+    """Calculates quantity dynamically using 80% of wallet balance, rounded down to 0.001 step size."""
+    allocated_inr = inr_balance * (allocation_pct / 100.0)
+    margin_usdt = allocated_inr / conversion_rate
+    position_value_usdt = margin_usdt * leverage
+    raw_qty = position_value_usdt / limit_price
+
+    step = Decimal("0.001")
+    floored_units = Decimal(str(math.floor(raw_qty / float(step))))
+    quantity = (floored_units * step).quantize(step, rounding=ROUND_DOWN)
+
+    required_usdt_margin = (float(quantity) * limit_price) / leverage
     required_inr_margin = required_usdt_margin * conversion_rate
 
     print(
-        f"[*] Sizing: Qty={qty} BTC | Est. Margin Required=₹{required_inr_margin:.2f} "
-        f"(Available: ₹{inr_balance:.2f})"
+        f"[*] Sizing ({allocation_pct}% balance allocation): Qty={quantity} BTC | "
+        f"Est. Margin Required=₹{required_inr_margin:.2f} (Available Balance: ₹{inr_balance:.2f})"
     )
+
+    if quantity < MIN_ALLOWED_BTC_QUANTITY:
+        raise ValueError(
+            f"Calculated quantity ({quantity} BTC) is below exchange minimum step size ({MIN_ALLOWED_BTC_QUANTITY} BTC)."
+        )
 
     if inr_balance < required_inr_margin:
         raise ValueError(
-            f"Insufficient INR balance (₹{inr_balance:.2f}) for minimum BTC order "
+            f"Insufficient INR balance (₹{inr_balance:.2f}) for calculated order size "
             f"(requires ~₹{required_inr_margin:.2f} at {leverage}x)."
         )
 
-    return float(qty)
+    return float(quantity)
 
 
 def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -356,7 +459,8 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
 
     inr_balance = get_futures_inr_balance()
     conversion_rate = get_inr_usdt_conversion()
-    quantity = calculate_min_btc_quantity(
+    
+    quantity = calculate_dynamic_btc_quantity(
         inr_balance=inr_balance,
         conversion_rate=conversion_rate,
         limit_price=limit_price,
@@ -429,6 +533,14 @@ def run_auto_trader():
     print("=== BTC AUTO-TRADER STARTED ===")
     if DRY_RUN:
         print("[*] DRY_RUN is enabled; orders will not be placed or canceled.")
+
+    if not DRY_RUN:
+        try:
+            closed_results = close_position_conditional_auto()
+            if closed_results:
+                print(f"[+] Successfully closed active position with a limit order at TP price and cleared old orders: {closed_results}")
+        except Exception as e:
+            print(f"[!] Note during position check: {e}")
 
     signal = asyncio.run(fetch_latest_btc_signal())
     if not signal:
