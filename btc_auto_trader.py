@@ -31,7 +31,7 @@ COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
 COINDCX_API_SECRET = os.getenv("COINDCX_API_SECRET", "")
 
 # GCP Static IP Proxy URL
-PROXY_URL = os.getenv("GCP_PROXY_URL", "http://35.208.231.235:8000")
+PROXY_URL = os.getenv("GCP_PROXY_URL", "")
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no"}
 
 # Trading Parameters (BTC Only)
