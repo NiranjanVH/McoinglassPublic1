@@ -25,6 +25,7 @@ jobs:
       COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
       COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
       GCP_PROXY_URL: ${{ secrets.GCP_PROXY_URL }}
+      ALLOCATION_PCT: ${{ github.event.client_payload.allocation_pct || '80' }}
       DRY_RUN: "false"
 
     steps:
