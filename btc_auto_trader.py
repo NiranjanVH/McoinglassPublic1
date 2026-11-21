@@ -38,10 +38,28 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no
 TARGET_PAIR = "B-BTC_USDT"
 LEVERAGE = 27
 TP_POINTS = 300.0
-BALANCE_ALLOCATION_PCT = 80.0             # Uses 80% of your INR wallet balance for margin
+DEFAULT_BALANCE_ALLOCATION_PCT = 80.0
 MIN_ALLOWED_BTC_QUANTITY = Decimal("0.001") # Lowest step size precision limit
 
 USER_AGENT = "RichieRich-AutoBTC/1.0"
+
+
+def get_configured_allocation_pct() -> float:
+    raw_val = (os.getenv("ALLOCATION_PCT") or "").strip()
+    if not raw_val:
+        return DEFAULT_BALANCE_ALLOCATION_PCT
+    try:
+        pct = float(raw_val)
+    except ValueError:
+        print(f"[!] Invalid ALLOCATION_PCT '{raw_val}', falling back to {DEFAULT_BALANCE_ALLOCATION_PCT}%.")
+        return DEFAULT_BALANCE_ALLOCATION_PCT
+    if pct <= 0 or pct > 100:
+        print(f"[!] Out-of-range ALLOCATION_PCT '{pct}', falling back to {DEFAULT_BALANCE_ALLOCATION_PCT}%.")
+        return DEFAULT_BALANCE_ALLOCATION_PCT
+    return pct
+
+
+BALANCE_ALLOCATION_PCT = get_configured_allocation_pct()
 
 
 # ==========================================================
@@ -274,7 +292,7 @@ def close_position_conditional_auto() -> List[Dict[str, Any]]:
     for target_pos in positions:
         if target_pos.get("pair") != TARGET_PAIR:
             continue
-        
+
         active_pos = float(target_pos.get("active_pos", 0) or 0)
         if active_pos == 0:
             continue
@@ -419,7 +437,7 @@ def calculate_dynamic_btc_quantity(
     leverage: int = LEVERAGE,
     allocation_pct: float = BALANCE_ALLOCATION_PCT,
 ) -> float:
-    """Calculates quantity dynamically using 80% of wallet balance, rounded down to 0.001 step size."""
+    """Calculates quantity dynamically using configured % of wallet balance, rounded down to 0.001 step size."""
     allocated_inr = inr_balance * (allocation_pct / 100.0)
     margin_usdt = allocated_inr / conversion_rate
     position_value_usdt = margin_usdt * leverage
@@ -459,12 +477,13 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
 
     inr_balance = get_futures_inr_balance()
     conversion_rate = get_inr_usdt_conversion()
-    
+
     quantity = calculate_dynamic_btc_quantity(
         inr_balance=inr_balance,
         conversion_rate=conversion_rate,
         limit_price=limit_price,
         leverage=LEVERAGE,
+        allocation_pct=BALANCE_ALLOCATION_PCT,
     )
 
     payload = {
@@ -531,6 +550,7 @@ def validate_config() -> None:
 def run_auto_trader():
     validate_config()
     print("=== BTC AUTO-TRADER STARTED ===")
+    print(f"[*] Active Wallet Allocation: {BALANCE_ALLOCATION_PCT}%")
     if DRY_RUN:
         print("[*] DRY_RUN is enabled; orders will not be placed or canceled.")
 
