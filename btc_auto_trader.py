@@ -39,6 +39,7 @@ TARGET_PAIR = "B-BTC_USDT"
 LEVERAGE = 27
 TP_POINTS = 300.0
 DEFAULT_BALANCE_ALLOCATION_PCT = 80.0
+FIFTY_PCT_SL_ROE_FRACTION = 0.50
 MIN_ALLOWED_BTC_QUANTITY = Decimal("0.001") # Lowest step size precision limit
 
 USER_AGENT = "RichieRich-AutoBTC/1.0"
@@ -469,6 +470,25 @@ def calculate_dynamic_btc_quantity(
     return float(quantity)
 
 
+def calculate_fifty_pct_investment_sl(
+    direction: str,
+    limit_price: float,
+    leverage: int = LEVERAGE,
+    allocation_pct: float = BALANCE_ALLOCATION_PCT,
+) -> Optional[float]:
+    """Calculates SL price equal to 50% of investment (50% ROE) ONLY when allocation_pct == 50.0."""
+    if allocation_pct != 50.0 or leverage <= 0:
+        return None
+
+    price_move_pct = FIFTY_PCT_SL_ROE_FRACTION / float(leverage)
+    if direction.upper() == "SHORT":
+        sl_price = limit_price * (1.0 + price_move_pct)
+    else:
+        sl_price = limit_price * (1.0 - price_move_pct)
+
+    return round(sl_price, 2)
+
+
 def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
     direction = signal_data["direction"]
     limit_price = signal_data["entry"]
@@ -486,19 +506,34 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
         allocation_pct=BALANCE_ALLOCATION_PCT,
     )
 
+    sl_price = calculate_fifty_pct_investment_sl(
+        direction=direction,
+        limit_price=limit_price,
+        leverage=LEVERAGE,
+        allocation_pct=BALANCE_ALLOCATION_PCT,
+    )
+
+    order_payload: Dict[str, Any] = {
+        "side": side,
+        "pair": TARGET_PAIR,
+        "order_type": "limit_order",
+        "price": limit_price,
+        "total_quantity": quantity,
+        "leverage": LEVERAGE,
+        "margin_currency_short_name": "INR",
+        "notification": "email_notification",
+        "take_profit_price": tp_price,
+    }
+
+    if sl_price is not None:
+        order_payload["stop_loss_price"] = sl_price
+        print(
+            f"[*] 50% allocation active -> Setting Stop Loss at 50% of investment (50% ROE): {sl_price:,.2f}"
+        )
+
     payload = {
         "timestamp": int(round(time.time() * 1000)),
-        "order": {
-            "side": side,
-            "pair": TARGET_PAIR,
-            "order_type": "limit_order",
-            "price": limit_price,
-            "total_quantity": quantity,
-            "leverage": LEVERAGE,
-            "margin_currency_short_name": "INR",
-            "notification": "email_notification",
-            "take_profit_price": tp_price,
-        },
+        "order": order_payload,
     }
 
     print(f"[*] Submitting {direction} Limit Order for {TARGET_PAIR}:\n{json.dumps(payload, indent=2)}")
@@ -513,7 +548,7 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(order_obj, dict) and order_obj.get("status") == "error":
         raise RuntimeError(order_obj.get("message", "Order creation failed"))
 
-    return {
+    result: Dict[str, Any] = {
         "order_id": order_obj.get("id") or order_obj.get("order_id") or "",
         "pair": TARGET_PAIR,
         "direction": direction,
@@ -523,6 +558,10 @@ def place_btc_limit_order(signal_data: Dict[str, Any]) -> Dict[str, Any]:
         "quantity": quantity,
         "leverage": LEVERAGE,
     }
+    if sl_price is not None:
+        result["stop_loss_price"] = sl_price
+
+    return result
 
 
 # ==========================================================
