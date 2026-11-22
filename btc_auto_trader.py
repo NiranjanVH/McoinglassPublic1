@@ -38,6 +38,7 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no
 TARGET_PAIR = "B-BTC_USDT"
 LEVERAGE = 27
 TP_POINTS = 300.0
+MIN_CONFIDENCE_PCT = 70.0
 DEFAULT_BALANCE_ALLOCATION_PCT = 80.0
 FIFTY_PCT_SL_ROE_FRACTION = 0.50
 MIN_ALLOWED_BTC_QUANTITY = Decimal("0.001") # Lowest step size precision limit
@@ -108,7 +109,21 @@ def parse_signal_text(text: str) -> Optional[Dict[str, Any]]:
 
     sl_match = re.search(r"Stop Loss\s*:\s*\$?([\d,]+(?:\.\d+)?)", clean_block, re.IGNORECASE)
     prob_match = re.search(r"Probability\s*:\s*([\d]+%)", clean_block, re.IGNORECASE)
-    conf_match = re.search(r"Confidence\s*:\s*([\d]+%)", clean_block, re.IGNORECASE)
+    conf_match = re.search(r"Confidence\s*:\s*([\d]+(?:\.\d+)?)%", clean_block, re.IGNORECASE)
+
+    if not conf_match:
+        print(f"[!] Ignoring signal: missing Confidence value (requires >= {MIN_CONFIDENCE_PCT:.0f}%).")
+        return None
+
+    confidence_num = float(conf_match.group(1))
+    if confidence_num < MIN_CONFIDENCE_PCT:
+        print(
+            f"[!] Ignoring signal: Confidence {confidence_num:g}% is below minimum "
+            f"threshold ({MIN_CONFIDENCE_PCT:g}%)."
+        )
+        return None
+
+    confidence_str = f"{conf_match.group(1)}%"
 
     return {
         "direction": direction,
@@ -118,7 +133,7 @@ def parse_signal_text(text: str) -> Optional[Dict[str, Any]]:
         "tp1": tp1_val,
         "sl_ignored": sl_match.group(1) if sl_match else "N/A",
         "probability": prob_match.group(1) if prob_match else "N/A",
-        "confidence": conf_match.group(1) if conf_match else "N/A",
+        "confidence": confidence_str,
     }
 
 
