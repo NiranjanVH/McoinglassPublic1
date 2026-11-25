@@ -61,7 +61,7 @@ def get_configured_allocation_pct() -> float:
     return pct
 
 
-BALANCE_ALLOCATION_PCT = get_configured_allocation_pct()
+BALANCE_ALLOCATION_PCT = DEFAULT_BALANCE_ALLOCATION_PCT
 
 
 # ==========================================================
